@@ -11,6 +11,7 @@
 
 #include <zephyr/types.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/usb/usb_device.h>
 
@@ -64,7 +65,7 @@ static const struct device *adc_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
 #define DEVICE_NAME_LEN	(sizeof(DEVICE_NAME) - 1)
 
 #define RUN_STATUS_LED DK_LED1
-#define RUN_LED_BLINK_INTERVAL 500
+#define RUN_LED_BLINK_INTERVAL 100
 
 #define CON_STATUS_LED DK_LED2
 
@@ -74,6 +75,8 @@ static const struct device *adc_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
 #define UART_BUF_SIZE CONFIG_BT_NUS_UART_BUFFER_SIZE
 #define UART_WAIT_FOR_BUF_DELAY K_MSEC(50)
 #define UART_WAIT_FOR_RX CONFIG_BT_NUS_UART_RX_WAIT_TIME
+
+#define PING_PONG_RAM_SIZE 16		//ping pong ram size is 1024 Byte
 
 static K_SEM_DEFINE(ble_init_ok, 0, 1);
 
@@ -90,8 +93,14 @@ struct uart_data_t {
 	uint16_t len;
 };
 
+//struct k_mem_slab ping_slab;
+//static K_MEM_SLAB_DEFINE(ping_slab,PING_PONG_RAM_SIZE,1,4);	//ping RAM
+//static K_MEM_SLAB_DEFINE(pong_slab,PING_PONG_RAM_SIZE,1,4);	//pong RAM
+
 static K_FIFO_DEFINE(fifo_uart_tx_data);
 static K_FIFO_DEFINE(fifo_uart_rx_data);
+static K_FIFO_DEFINE(ping_uart_tx_data);
+static K_FIFO_DEFINE(pong_uart_rx_data);
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -152,6 +161,46 @@ static uint16_t read_adc_value(const struct device *adc_dev);
 void adc_thread_func();
 void uart_thread_func();
 void fifo_put(uint16_t data);
+
+
+ static int ram_init(void)
+{
+	struct uart_data_t *ping_buf;
+	struct uart_data_t *ping_tx;
+	uint8_t met[PING_PONG_RAM_SIZE];
+	//struct ping_slab *ping_buf;
+	struct uint8_t *ping_ptr;
+	//char ping_buf[PING_PONG_RAM_SIZE];
+	//k_mem_slab_alloc(&ping_slab, (void **)&ping_ptr, K_MSEC(100));
+
+	for(int i=0; i<PING_PONG_RAM_SIZE; ++i){	//PING_PONG_RAM_SIZE
+		met[i] = i;
+		//ping_buf->data[i] = i;
+		//printk("buf ram are %u\n", met[i]);
+		//memset(ping_ptr+i,i,PING_PONG_RAM_SIZE);
+		//printf(ping_ptr[i] );
+	}
+	
+	//printk("buf ram are %u\n", met);
+	ping_buf->len = PING_PONG_RAM_SIZE;
+//	ping_buf->data = met;
+	memcpy(ping_buf->data, *met,PING_PONG_RAM_SIZE);
+	//printk("buf ram are %u\n", ping_buf->data);
+	k_fifo_put(&ping_uart_tx_data, ping_buf);
+
+	k_free(ping_buf);
+	ping_tx = k_fifo_get(&ping_uart_tx_data,K_NO_WAIT);//CONTAINER_OF(ping_ptr, struct uart_data_t, data);
+
+	//uart_tx(uart_dev, ping_tx->data,ping_tx->len, SYS_FOREVER_MS);
+	//printk("buf ram are %u\n", ping_tx->data[1]);
+	//LOG_INF("ping buf UART %d", ping_tx);
+	//memcpy(ping_buf, ping_ptr, PING_PONG_RAM_SIZE);
+	//LOG_INF("ping is %s",ping_buf); 
+	// uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
+	//uart_tx(uart, ping_buf->data, PING_PONG_RAM_SIZE, SYS_FOREVER_MS);
+	//k_mem_slab_free(&ping_slab,(void *)ping_ptr);
+	return;
+} 
 static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
 {
 	ARG_UNUSED(dev);
@@ -588,6 +637,21 @@ void error(void)
 	}
 }
 
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+static void num_comp_reply(bool accept)
+{
+	if (accept) {
+		bt_conn_auth_passkey_confirm(auth_conn);
+		LOG_INF("Numeric Match, conn %p", (void *)auth_conn);
+	} else {
+		bt_conn_auth_cancel(auth_conn);
+		LOG_INF("Numeric Reject, conn %p", (void *)auth_conn);
+	}
+
+	bt_conn_unref(auth_conn);
+	auth_conn = NULL;
+}
+
 // ADC initialization function
 static int adc_init(const struct device *adc_dev) {
     int error = adc_channel_setup(adc_dev, &channel_cfg);
@@ -665,8 +729,8 @@ void fifo_put(uint16_t data) {
     }
 } */
 
- void button_changed(uint32_t button_state, uint32_t has_changed)
- {
+void button_changed(uint32_t button_state, uint32_t has_changed)
+{
  	uint32_t buttons = button_state & has_changed;
 
  	if (auth_conn) {
@@ -678,30 +742,34 @@ void fifo_put(uint16_t data) {
 			num_comp_reply(false);
 		}
  	}
- } 
+}
+#endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
 
 static void configure_gpio(void)
 {
 	int err;
 
-// #ifdef CONFIG_BT_NUS_SECURITY_ENABLED
-// 	err = dk_buttons_init(button_changed);
-// 	if (err) {
-// 		LOG_ERR("Cannot init buttons (err: %d)", err);
-// 	}
-// #endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+	err = dk_buttons_init(button_changed);
+	if (err) {
+		LOG_ERR("Cannot init buttons (err: %d)", err);
+	}
+#endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
 
 	err = dk_leds_init();
 	if (err) {
 		LOG_ERR("Cannot init LEDs (err: %d)", err);
 	}
 }
-// Main function
-int main(void) {
+
+int main(void)
+{
 	int blink_status = 0;
 	int err = 0;
 
 	configure_gpio();
+
+	ram_init();
 
 	err = uart_init();
 	if (err) {
@@ -715,24 +783,51 @@ int main(void) {
     //                                   adc_thread_func, NULL, NULL, NULL,
     //                                   7, 0, K_NO_WAIT);
 
-    // k_tid_t uart_tid = k_thread_create(&uart_thread_data, uart_thread_stack,
-    //                                    K_THREAD_STACK_SIZEOF(uart_thread_stack),
-    //                                    uart_thread_func, NULL, NULL, NULL,
-    //                                    7, 0, K_NO_WAIT);
+	if (IS_ENABLED(CONFIG_BT_NUS_SECURITY_ENABLED)) {
+		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
+		if (err) {
+			printk("Failed to register authorization callbacks.\n");
+			return 0;
+		}
 
-    // Start threads
-    // k_thread_start(adc_tid);
-    // k_thread_start(uart_tid);
+		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+		if (err) {
+			printk("Failed to register authorization info callbacks.\n");
+			return 0;
+		}
+	}
+
+	err = bt_enable(NULL);
+	if (err) {
+		error();
+	}
+
+	LOG_INF("Bluetooth initialized");
 
 	k_sem_give(&ble_init_ok);
 
-    
+	if (IS_ENABLED(CONFIG_SETTINGS)) {
+		settings_load();
+	}
+
+	err = bt_nus_init(&nus_cb);
+	if (err) {
+		LOG_ERR("Failed to initialize UART service (err: %d)", err);
+		return 0;
+	}
+
+	err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd,
+			      ARRAY_SIZE(sd));
+	if (err) {
+		LOG_ERR("Advertising failed to start (err %d)", err);
+		return 0;
+	}
+
 	for (;;) {
 		dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
 		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
 	}
 }
-
 
 void ble_write_thread(void)
 {
