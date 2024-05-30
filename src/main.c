@@ -17,13 +17,6 @@
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
-#include <zephyr/drivers/adc.h>
-#include <zephyr/drivers/uart.h>
-#include <zephyr/toolchain.h>
-#include <stddef.h>
-#include <stdarg.h>
-#include <inttypes.h>
-#include <hal/nrf_saadc.h>
 #include <soc.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
@@ -44,20 +37,6 @@
 #define LOG_MODULE_NAME peripheral_uart
 LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
-// ADC configuration
-#define ADC_CHANNEL_ID 1
-#define ADC_RESOLUTION  12
-static const struct device *adc_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
-
-#define ADC_PORT        SAADC_CH_PSELP_PSELP_AnalogInput0
-#define ADC_REFERENCE   ADC_REF_INTERNAL
-#define ADC_GAIN        ADC_GAIN_1_5
-#define ADC_ACQUISITION_TIME ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)
-
-// User Configuration: Read-interval (ms), FIFO size (packets)
-#define INTERVAL_MS             1000
-#define FIFO_ALLOC_SIZE         100
-
 #define STACKSIZE CONFIG_BT_NUS_THREAD_STACK_SIZE
 #define PRIORITY 7
 
@@ -65,7 +44,7 @@ static const struct device *adc_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
 #define DEVICE_NAME_LEN	(sizeof(DEVICE_NAME) - 1)
 
 #define RUN_STATUS_LED DK_LED1
-#define RUN_LED_BLINK_INTERVAL 100
+#define RUN_LED_BLINK_INTERVAL 500
 
 #define CON_STATUS_LED DK_LED2
 
@@ -83,8 +62,7 @@ static K_SEM_DEFINE(ble_init_ok, 0, 1);
 static struct bt_conn *current_conn;
 static struct bt_conn *auth_conn;
 
-// Define UART Device Name (ref. Device tree)
-static const struct device *uart_dev = DEVICE_DT_GET(DT_NODELABEL(uart0));
+static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(nordic_nus_uart));
 static struct k_work_delayable uart_work;
 
 struct uart_data_t {
@@ -116,51 +94,6 @@ UART_ASYNC_ADAPTER_INST_DEFINE(async_adapter);
 #else
 static const struct device *const async_adapter;
 #endif
-
-// ADC buffer
-static uint16_t sample_buffer;
-
-// FIFO item counter
-static uint8_t fifo_size;
-
-struct adc_channel_cfg channel_cfg = {
-    .gain = ADC_GAIN,
-    .reference = ADC_REFERENCE,
-    .acquisition_time = ADC_ACQUISITION_TIME,
-    .channel_id = ADC_CHANNEL_ID,
-#ifdef CONFIG_ADC_NRFX_SAADC
-    .input_positive = ADC_PORT
-#endif
-};
-//int16_t sample_buffer[1];
-
-static const struct adc_sequence sequence = {
-    .channels       = BIT(ADC_CHANNEL_ID),
-    .buffer         = &sample_buffer,
-    .buffer_size    = sizeof(sample_buffer),
-    .resolution     = ADC_RESOLUTION        
-};
-
-
-// FIFO item structure
-struct data_item_t {
-    void *fifo_reserved;        // For FIFO use
-    uint16_t data;              // Data byte
-};
-
-// Define FIFO and thread stacks
-K_FIFO_DEFINE(my_fifo);
-K_THREAD_STACK_DEFINE(adc_thread_stack, 1024);
-K_THREAD_STACK_DEFINE(uart_thread_stack, 1024);
-struct k_thread adc_thread_data;
-struct k_thread uart_thread_data;
-
-// Function prototypes
-static int adc_init(const struct device *adc_dev);
-static uint16_t read_adc_value(const struct device *adc_dev);
-void adc_thread_func();
-void uart_thread_func();
-void fifo_put(uint16_t data);
 
 
  static int ram_init(void)
@@ -201,6 +134,7 @@ void fifo_put(uint16_t data);
 	//k_mem_slab_free(&ping_slab,(void *)ping_ptr);
 	return;
 } 
+
 static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
 {
 	ARG_UNUSED(dev);
@@ -235,7 +169,7 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 			return;
 		}
 
-		if (uart_tx(uart_dev, buf->data, buf->len, SYS_FOREVER_MS)) {
+		if (uart_tx(uart, buf->data, buf->len, SYS_FOREVER_MS)) {
 			LOG_WRN("Failed to send data over UART");
 		}
 
@@ -253,7 +187,7 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 		if ((evt->data.rx.buf[buf->len - 1] == '\n') ||
 		    (evt->data.rx.buf[buf->len - 1] == '\r')) {
 			disable_req = true;
-			uart_rx_disable(uart_dev);
+			uart_rx_disable(uart);
 		}
 
 		break;
@@ -271,7 +205,7 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 			return;
 		}
 
-		uart_rx_enable(uart_dev, buf->data, sizeof(buf->data),
+		uart_rx_enable(uart, buf->data, sizeof(buf->data),
 			       UART_WAIT_FOR_RX);
 
 		break;
@@ -281,7 +215,7 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 		buf = k_malloc(sizeof(*buf));
 		if (buf) {
 			buf->len = 0;
-			uart_rx_buf_rsp(uart_dev, buf->data, sizeof(buf->data));
+			uart_rx_buf_rsp(uart, buf->data, sizeof(buf->data));
 		} else {
 			LOG_WRN("Not able to allocate UART receive buffer");
 		}
@@ -311,7 +245,7 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 		buf = CONTAINER_OF(aborted_buf, struct uart_data_t,
 				   data);
 
-		uart_tx(uart_dev, &buf->data[aborted_len],
+		uart_tx(uart, &buf->data[aborted_len],
 			buf->len - aborted_len, SYS_FOREVER_MS);
 
 		break;
@@ -334,7 +268,7 @@ static void uart_work_handler(struct k_work *item)
 		return;
 	}
 
-	uart_rx_enable(uart_dev, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
+	uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
 }
 
 static bool uart_test_async_api(const struct device *dev)
@@ -352,7 +286,7 @@ static int uart_init(void)
 	struct uart_data_t *rx;
 	struct uart_data_t *tx;
 
-	if (!device_is_ready(uart_dev)) {
+	if (!device_is_ready(uart)) {
 		return -ENODEV;
 	}
 
@@ -374,13 +308,13 @@ static int uart_init(void)
 	k_work_init_delayable(&uart_work, uart_work_handler);
 
 
-	if (IS_ENABLED(CONFIG_BT_NUS_UART_ASYNC_ADAPTER) && !uart_test_async_api(uart_dev)) {
+	if (IS_ENABLED(CONFIG_BT_NUS_UART_ASYNC_ADAPTER) && !uart_test_async_api(uart)) {
 		/* Implement API adapter */
-		uart_async_adapter_init(async_adapter, uart_dev);
-		uart_dev = async_adapter;
+		uart_async_adapter_init(async_adapter, uart);
+		uart = async_adapter;
 	}
 
-	err = uart_callback_set(uart_dev, uart_cb, NULL);
+	err = uart_callback_set(uart, uart_cb, NULL);
 	if (err) {
 		k_free(rx);
 		LOG_ERR("Cannot initialize UART callback");
@@ -392,7 +326,7 @@ static int uart_init(void)
 		while (true) {
 			uint32_t dtr = 0;
 
-			uart_line_ctrl_get(uart_dev, UART_LINE_CTRL_DTR, &dtr);
+			uart_line_ctrl_get(uart, UART_LINE_CTRL_DTR, &dtr);
 			if (dtr) {
 				break;
 			}
@@ -400,11 +334,11 @@ static int uart_init(void)
 			k_sleep(K_MSEC(100));
 		}
 		LOG_INF("DTR set");
-		err = uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_DCD, 1);
+		err = uart_line_ctrl_set(uart, UART_LINE_CTRL_DCD, 1);
 		if (err) {
 			LOG_WRN("Failed to set DCD, ret code %d", err);
 		}
-		err = uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_DSR, 1);
+		err = uart_line_ctrl_set(uart, UART_LINE_CTRL_DSR, 1);
 		if (err) {
 			LOG_WRN("Failed to set DSR, ret code %d", err);
 		}
@@ -429,7 +363,7 @@ static int uart_init(void)
 		return -ENOMEM;
 	}
 
-	err = uart_tx(uart_dev, tx->data, tx->len, SYS_FOREVER_MS);
+	err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
 	if (err) {
 		k_free(rx);
 		k_free(tx);
@@ -437,7 +371,7 @@ static int uart_init(void)
 		return err;
 	}
 
-	err = uart_rx_enable(uart_dev, rx->data, sizeof(rx->data), 50);
+	err = uart_rx_enable(uart, rx->data, sizeof(rx->data), 50);
 	if (err) {
 		LOG_ERR("Cannot enable uart reception (err: %d)", err);
 		/* Free the rx buffer only because the tx buffer will be handled in the callback */
@@ -446,6 +380,7 @@ static int uart_init(void)
 
 	return err;
 }
+
 
 static void connected(struct bt_conn *conn, uint8_t err)
 {
@@ -616,7 +551,7 @@ static void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data,
 			tx->len++;
 		}
 
-		err = uart_tx(uart_dev, tx->data, tx->len, SYS_FOREVER_MS);
+		err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
 		if (err) {
 			k_fifo_put(&fifo_uart_tx_data, tx);
 		}
@@ -652,96 +587,19 @@ static void num_comp_reply(bool accept)
 	auth_conn = NULL;
 }
 
-// ADC initialization function
-static int adc_init(const struct device *adc_dev) {
-    int error = adc_channel_setup(adc_dev, &channel_cfg);
-    if (error) {
-        printk("Error setting up ADC channel during initialization: %d\n", error);
-        return error;
-    }
-
-    // Perform a single ADC read for initialization purpose
-    error = adc_read(adc_dev, &sequence);
-    if (error) {
-        printk("Error reading ADC during initialization: %d\n", error);
-    }
-
-    return error;
-}
-
-// Function to read from ADC and return the value
-static uint16_t read_adc_value(const struct device *adc_dev) {
-    int error = adc_read(adc_dev, &sequence);
-    if (error) {
-        printk("Error performing ADC read (read_adc_value): %d\n", error);
-        return error;
-    }
-
-    return sample_buffer;
-}
-
-// Adjust adc_thread_func as per the new function signatures
-void adc_thread_func() {
-    //const struct device *adc_dev = device_get_binding(ADC_DEVICE_NAME); // TODO: device_get_binding deprecated
-    if (!adc_dev || adc_init(adc_dev) != 0) {
-        printk("ADC device or initialization failed\n");
-        return;
-    }
-
-    while (1) {
-        // Read ADC value (uint16_t)
-        uint16_t adc_value = read_adc_value(adc_dev);
-        printk("ADC Value: %d\n", adc_value);
-        // Put current ADC value (0xF + 12-bit measurement) into FIFO (&my_fifo)
-        fifo_put(adc_value & 0xFFFF);
-
-        // Trigger UART thread to start dumping FIFO data
-        if (fifo_size >= FIFO_ALLOC_SIZE) {
-            k_thread_resume(&uart_thread_data);
-        }
-
-        k_msleep(INTERVAL_MS);
-    }
-}
-
-void fifo_put(uint16_t data) {
-    // FIFO ADC measurement (unsigned 16-bit) memory allocation (size of struct data_item_t)
-    struct data_item_t *item = k_malloc(sizeof(struct data_item_t));
-    if (item) {
-        item->data = data;
-        k_fifo_put(&my_fifo, item);
-        fifo_size = fifo_size + 1;
-    }
-}
-
-/* void uart_thread_func() {
-    // UART device
-    //const struct device *uart_dev = device_get_binding(UART_DEVICE_NAME); // TODO: device_get_binding deprecated
-    while (1) {
-        // Get FIFO data item (FIFO pointer and 16-bit unsigned int)
-        struct data_item_t *item = k_fifo_get(&my_fifo, K_NO_WAIT);
-        if (item != NULL) {
-            // Write 16-bit datum to UART data register
-            uart_poll_out_u16(uart_dev, item->data); // TODO: verify whether pointer or data is passed here, review syntax
-            // Free memory at address of current FIFO item
-            k_free(item);
-        }
-    }
-} */
-
 void button_changed(uint32_t button_state, uint32_t has_changed)
 {
- 	uint32_t buttons = button_state & has_changed;
+	uint32_t buttons = button_state & has_changed;
 
- 	if (auth_conn) {
- 		if (buttons & KEY_PASSKEY_ACCEPT) {
- 			num_comp_reply(true);
- 		}
+	if (auth_conn) {
+		if (buttons & KEY_PASSKEY_ACCEPT) {
+			num_comp_reply(true);
+		}
 
- 		if (buttons & KEY_PASSKEY_REJECT) {
+		if (buttons & KEY_PASSKEY_REJECT) {
 			num_comp_reply(false);
 		}
- 	}
+	}
 }
 #endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
 
@@ -775,13 +633,6 @@ int main(void)
 	if (err) {
 		error();
 	}
-    printk("Starting ADC read with FIFO and UART dump\n");
-    fifo_size = 0;
-    // Create threads
-    // k_tid_t adc_tid = k_thread_create(&adc_thread_data, adc_thread_stack,
-    //                                   K_THREAD_STACK_SIZEOF(adc_thread_stack),
-    //                                   adc_thread_func, NULL, NULL, NULL,
-    //                                   7, 0, K_NO_WAIT);
 
 	if (IS_ENABLED(CONFIG_BT_NUS_SECURITY_ENABLED)) {
 		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
